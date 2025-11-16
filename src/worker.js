@@ -1,93 +1,138 @@
-// src/worker.js - Сервер Обчислень (Worker)
-const { heavyTaskQueue, updateTaskStatus, getTask } = require('./queue');
-const { publishUpdate } = require('./pubsub'); // Підключаємо наш Pub/Sub
-// Встановлюємо максимальний ліміт ітерацій для імітації довгої задачі
-const MAX_ITERATIONS = 1e12; 
+// src/worker.js
+const { Worker } = require('worker_threads');
+const path = require('path'); // <--- ОСЬ ВИПРАВЛЕННЯ: Імпортуємо модуль 'path'
+require('dotenv').config();
 
-console.log(`Worker process started. Monitoring queue...`);
+// Створюємо змінну для шляху до нашого скрипта обчислень
+const computeScriptPath = path.join(__dirname, 'compute.js'); 
 
-// --- ФУНКЦІЯ ОБЧИСЛЕННЯ (Monte Carlo) ---
-async function runHeavyCalculation(iterations, jobId, userId) {
-    let hits = 0;
-    const totalIterations = iterations;
-    
-    // Якщо ітерацій занадто багато, обрізаємо їх, щоб уникнути зависання
-    const actualIterations = Math.min(iterations, MAX_ITERATIONS); 
-    
-    const progressInterval = actualIterations / 100; // Оновлення кожні 1%
-    
-    for (let i = 0; i < actualIterations; i++) {
-        const x = Math.random();
-        const y = Math.random();
-        if (x * x + y * y <= 1) {
-            hits++;
-        }
+// Імпортуємо наші нові модулі, сумісні з SQLite
+const { heavyTaskQueue, updateTaskStatus } = require('./queue'); //
+const { publishUpdate, CHANNEL } = require('./pubsub'); //
 
-        // --- Контроль Прогресу та Скасування ---
-        if (i > 0 && i % progressInterval === 0) {
-            const progress = Math.floor((i / actualIterations) * 100);
-            
-            // 1. Сповіщення Основного Сервера про прогрес (Пункт 2)
-            publishUpdate({ jobId, progress, status: 'RUNNING', userId });
-            
-            // 2. Перевірка на скасування (Пункт 3)
-            // Оскільки ми не хочемо робити запит до БД на кожній ітерації, 
-            // перевіряємо стан лише під час оновлення прогресу
-            const taskInDb = await getTask(jobId);
-            if (taskInDb && taskInDb.status === 'CANCELED') {
-                 // Оновлюємо фінальний статус у БД
-                await updateTaskStatus(jobId, 'CANCELED', progress); 
-                return { status: 'CANCELED', result: null };
-            }
-            
-            // 3. Оновлення статусу в БД (Це також можна робити рідше)
-            await updateTaskStatus(jobId, 'RUNNING', progress);
-        }
-    }
+// Унікальний ID для цього воркера
+const WORKER_ID = process.env.WORKER_ID || `Worker-${process.pid}`;
 
-    const piEstimate = (hits / actualIterations) * 4;
-    return { 
-        status: 'COMPLETED',
-        result: { pi: piEstimate, iterations: actualIterations }
-    };
-}
+// Кількість одночасних завдань
+const CONCURRENCY = 1;
 
+console.log(`[Worker: ${WORKER_ID}] ✅ Сервер обчислень (SQLite) запущено. Очікую на завдання...`);
 
-// --- ОБРОБНИК ЧЕРГИ Bull ---
-heavyTaskQueue.process(1, async (job) => { // 1 - одночасна обробка задач на цьому worker-процесі
-    const { taskData, userId } = job.data;
+/**
+ * Головний обробник черги Bull
+ */
+heavyTaskQueue.process(CONCURRENCY, async (job) => {
+    const { taskParams, userId } = job.data;
     const jobId = job.id;
-    
-    console.log(`[TASK ${jobId}] Starting calculation for user ${userId}...`);
 
-    // Встановлюємо початковий стан RUNNING
-    await updateTaskStatus(jobId, 'RUNNING', 0);
-    publishUpdate({ jobId, progress: 0, status: 'RUNNING', userId });
+    console.log(`[Worker: ${WORKER_ID}] ⏯️  Отримано завдання ${jobId} для користувача ${userId}`);
 
     try {
-        const result = await runHeavyCalculation(taskData.iterations, jobId, userId);
+        // 1. Позначити завдання як 'RUNNING' в БД та повідомити клієнта
+        await updateTaskStatus(jobId, 'RUNNING', 0, null);
+        await publishUpdate({ 
+            jobId: jobId, 
+            userId: userId, 
+            status: 'RUNNING', 
+            progress: 0, 
+            workerId: WORKER_ID 
+        });
 
-        // Фінальне оновлення
-        if (result.status === 'COMPLETED') {
-            await updateTaskStatus(jobId, 'COMPLETED', 100, result.result);
-            publishUpdate({ jobId, progress: 100, status: 'COMPLETED', userId });
-            console.log(`[TASK ${jobId}] Finished. Result: ${result.result.pi.toFixed(5)}`);
-        } else if (result.status === 'CANCELED') {
-             console.log(`[TASK ${jobId}] CANCELED by user.`);
-             publishUpdate({ jobId, progress: 0, status: 'CANCELED', userId });
-        }
-        
-        return result; 
-    } catch (error) {
-        // Обробка непередбачених помилок
-        await updateTaskStatus(jobId, 'ERROR', 0, { error: error.message });
-        publishUpdate({ jobId, progress: 0, status: 'ERROR', userId });
-        console.error(`[TASK ${jobId}] ERROR:`, error.message);
-        throw error; // Повідомити Bull про помилку
+        // 2. Створити Promise, який буде очікувати завершення потоку
+        return new Promise((resolve, reject) => {
+            
+            // Запускаємо наш CPU-інтенсивний файл в окремому потоці
+            // Використовуємо змінну `computeScriptPath`
+            const worker = new Worker(computeScriptPath, {
+                workerData: { 
+                    taskParams, 
+                    userId, 
+                    jobId 
+                }, // Передаємо дані в потік
+            });
+
+            // 3. Обробка повідомлень від потоку
+            worker.on('message', async (message) => {
+                
+                if (message.type === 'progress') {
+                    // (Пункт 2: Інформування про хід виконання)
+                    await updateTaskStatus(jobId, 'RUNNING', message.progress, null);
+                    await publishUpdate({
+                        jobId: jobId,
+                        userId: userId,
+                        status: 'RUNNING',
+                        progress: message.progress,
+                        workerId: WORKER_ID,
+                    });
+                
+                } else if (message.type === 'completed') {
+                    console.log(`[Worker: ${WORKER_ID}] 🏁 Завдання ${jobId} завершено.`);
+                    
+                    await updateTaskStatus(jobId, 'COMPLETED', 100, message.result);
+                    await publishUpdate({
+                        jobId: jobId,
+                        userId: userId,
+                        status: 'COMPLETED',
+                        progress: 100,
+                        result: message.result, // Надсилаємо фінальний результат
+                        workerId: WORKER_ID,
+                    });
+                    resolve(message.result); // Завершуємо завдання Bull
+                
+                } else if (message.type === 'failed') {
+                    console.error(`[Worker: ${WORKER_ID}] ❌ Помилка в потоці ${jobId}: ${message.error}`);
+                    await updateTaskStatus(jobId, 'FAILED', 100, { error: message.error });
+                    await publishUpdate({
+                        jobId: jobId,
+                        userId: userId,
+                        status: 'FAILED',
+                        progress: 100,
+                        result: { error: message.error }, // Надсилаємо помилку
+                        workerId: WORKER_ID,
+                    });
+                    reject(new Error(message.error)); // Повідомляємо Bull про помилку
+                
+                } else if (message.type === 'canceled') {
+                    // (Пункт 3: Скасування задачі)
+                    console.log(`[Worker: ${WORKER_ID}] 🛑 Завдання ${jobId} скасовано потоком.`);
+                    // Статус 'CANCELED' вже встановлено в БД з server.js
+                    resolve({ status: 'canceled' });
+                }
+            });
+
+            // 4. Обробка критичних помилок потоку
+            worker.on('error', async (err) => {
+                console.error(`[Worker: ${WORKER_ID}] ❌ Критична помилка потоку ${jobId}:`, err);
+                await updateTaskStatus(jobId, 'FAILED', 100, { error: err.message });
+                await publishUpdate({
+                    jobId,
+                    userId,
+                    status: 'FAILED',
+                    progress: 100,
+                    result: { error: err.message },
+                    workerId: WORKER_ID,
+                });
+                reject(err);
+            });
+
+            worker.on('exit', (code) => {
+                if (code !== 0) {
+                    const errorMsg = `Потік несподівано завершився з кодом ${code}`;
+                    console.error(`[Worker: ${WORKER_ID}] ❌ ${errorMsg} для ${jobId}`);
+                    // Завдання буде позначено як FAILED
+                    reject(new Error(errorMsg));
+                }
+            });
+        });
+    } catch (e) {
+        console.error(`[Worker: ${WORKER_ID}] ❌ Фатальна помилка обробки ${jobId}:`, e);
+        // Якщо помилка сталася до запуску потоку
+        await updateTaskStatus(jobId, 'FAILED', 0, { error: e.message });
+        throw e; // Bull перенесе завдання у failed
     }
 });
 
-// Щоб worker не впав через необроблені винятки
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+// Обробка помилок самої черги
+heavyTaskQueue.on('failed', (job, err) => {
+  console.error(`[Worker: ${WORKER_ID}] ❌ Завдання ${job.id} зазнало невдачі в Bull:`, err.message);
 });

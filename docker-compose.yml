@@ -1,25 +1,4 @@
 services:
-  db:
-    image: postgres:14-alpine
-    container_name: hardwork_postgres
-    restart: always
-    environment:
-      POSTGRES_USER: myuser
-      POSTGRES_PASSWORD: mypassword
-      POSTGRES_DB: hardworkdb
-    ports:
-      - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./apply-pg-hba.sh:/apply-pg-hba.sh:ro
-    command: >
-      sh -c "
-        docker-entrypoint.sh postgres &
-        sleep 8 &&
-        sh /apply-pg-hba.sh &&
-        wait
-      "
-
   redis:
     image: redis:7-alpine
     container_name: hardwork_redis
@@ -36,10 +15,11 @@ services:
       - "80:80"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    # Nginx тепер залежить лише від Redis (хоча це не сувора вимога,
+    # але ми залишили depends_on, щоб Redis стартував першим)
     depends_on:
-      - db
       - redis
 
 volumes:
-  postgres_data:
+  # Ми видалили postgres_data, оскільки він більше не потрібен
   redis_data:

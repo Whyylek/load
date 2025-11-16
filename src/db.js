@@ -1,49 +1,118 @@
 // src/db.js
-const { Pool } = require('pg');
-require('dotenv').config(); // Для завантаження змінних з файлу .env
+const sqlite3 = require('sqlite3').verbose();
+const path = require('path');
 
-console.log('=== DB CONFIG ===');
-console.log('User:', process.env.DB_USER);
-console.log('Host:', process.env.DB_HOST);
-console.log('Database:', process.env.DB_NAME);
-console.log('Password exists:', !!process.env.DB_PASSWORD);
-console.log('Port:', process.env.DB_PORT);
+// Шлях до файлу бази даних залишається незмінним
+const DB_PATH = path.join(__dirname, '..', 'hardwork.db');
 
-const pool = new Pool({
-    user: process.env.DB_USER || 'user',
-    host: process.env.DB_HOST || 'localhost',
-    database: process.env.DB_NAME || 'hardworkdb',
-    password: process.env.DB_PASSWORD || 'password',
-    port: process.env.DB_PORT || 5432,
-});
-// Функція для ініціалізації таблиць
+/**
+ * Ця функція тепер створює НОВЕ з'єднання з БД
+ * і вмикає режим 'WAL' (Write-Ahead Logging).
+ * WAL є КРИТИЧНО ВАЖЛИВИМ для того, щоб дозволити 'compute.js' (який читає)
+ * бачити зміни, які 'server.js' (який пише) робить *одночасно*.
+ */
+function getDbConnection() {
+    return new Promise((resolve, reject) => {
+        const db = new sqlite3.Database(DB_PATH, (err) => {
+            if (err) {
+                return reject(err);
+            }
+        });
+
+        // ВМИКАЄМО РЕЖИМ WAL (ВИРІШУЄ ПРОБЛЕМУ СКАСУВАННЯ)
+        db.exec('PRAGMA journal_mode = WAL;', (err) => {
+            if (err) {
+                return reject(err);
+            }
+            resolve(db);
+        });
+    });
+}
+
+/**
+ * Наш 'pool' тепер буде обгорткою, яка створює
+ * нове з'єднання для кожного запиту і закриває його.
+ * Це робить SQLite безпечним для паралельного доступу з багатьох процесів.
+ */
+const pool = {
+    query: (text, params = []) => {
+        // Перетворюємо $1, $2 на ?, ? (синтаксис SQLite)
+        const sql = text.replace(/\$\d+/g, '?');
+        
+        return new Promise(async (resolve, reject) => {
+            let db;
+            try {
+                // 1. Отримуємо нове, свіже з'єднання
+                db = await getDbConnection();
+
+                // 2. Виконуємо запит
+                if (sql.trim().toUpperCase().startsWith('SELECT')) {
+                    db.all(sql, params, (err, rows) => {
+                        if (err) return reject(err);
+                        resolve({ rows: rows });
+                    });
+                } else {
+                    db.run(sql, params, function (err) {
+                        if (err) return reject(err);
+                        resolve({ 
+                            rows: [{ id: this.lastID }], // Повертаємо lastID для INSERT
+                            rowCount: this.changes 
+                        });
+                    });
+                }
+            } catch (err) {
+                reject(err);
+            } finally {
+                // 3. Закриваємо з'єднання, незалежно від результату
+                if (db) {
+                    db.close((err) => {
+                        if (err) console.error("❌ Помилка закриття БД SQLite:", err.message);
+                    });
+                }
+            }
+        });
+    }
+};
+
+// Функція ініціалізації залишається такою ж, але тепер вона
+// буде використовувати наш новий 'pool.query', який безпечний для процесів.
 async function initDB() {
     try {
+        console.log('Ініціалізація схеми SQLite...');
+        
         await pool.query(`
             CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
-                username VARCHAR(50) UNIQUE NOT NULL,
-                password_hash VARCHAR(100) NOT NULL
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            
+        `);
+        
+        await pool.query(`
             CREATE TABLE IF NOT EXISTS tasks (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                job_id INTEGER NOT NULL UNIQUE, -- ID задачі з Redis/Bull
-                status VARCHAR(20) NOT NULL DEFAULT 'PENDING',
+                job_id INTEGER NOT NULL UNIQUE, 
+                status TEXT NOT NULL DEFAULT 'PENDING',
                 progress INTEGER NOT NULL DEFAULT 0,
-                params JSONB,
-                result JSONB,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                params TEXT, 
+                result TEXT, 
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
             );
-            
-            -- Додамо індекс для швидкого пошуку по користувачу та статусу
+        `);
+        
+        await pool.query(`
             CREATE INDEX IF NOT EXISTS idx_tasks_user_status ON tasks (user_id, status);
         `);
-        console.log("Database initialized successfully.");
+        
+        // Перевіряємо, чи ввімкнено WAL
+        const pragmaRes = await pool.query("PRAGMA journal_mode;");
+        console.log(`✅ Схему SQLite успішно ініціалізовано (Journal Mode: ${pragmaRes.rows[0].journal_mode})`);
+        
     } catch (err) {
-        console.error("Error initializing database:", err);
+        console.error("❌ Помилка ініціалізації SQLite:", err);
     }
 }
 
