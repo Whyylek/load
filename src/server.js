@@ -1,4 +1,4 @@
-// src/server.js
+
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
@@ -7,17 +7,17 @@ const { Server } = require('socket.io');
 const cors = require('cors'); 
 require('dotenv').config();
 
-// Логіка з наших файлів SQLite:
+
 const { initDB, pool } = require('./db'); 
 const { addTask, getTask, updateTaskStatus, heavyTaskQueue } = require('./queue'); 
 
-// ---!!! (ВИПРАВЛЕННЯ ТУТ) Додаємо 'publishUpdate' до імпорту ---!!!
-const { subscriber, CHANNEL, publisher, CANCEL_CHANNEL, publishUpdate } = require('./pubsub'); 
+
+const { progressSubscriber, CHANNEL, publisher, CANCEL_CHANNEL, publishUpdate } = require('./pubsub'); 
 
 const app = express();
 const httpServer = http.createServer(app); 
 
-// Налаштування CORS для Express
+
 app.use(cors());
 
 const io = new Server(httpServer, {
@@ -73,15 +73,17 @@ io.on('connection', (socket) => {
     });
 });
 
+// ---!!! (ВИПРАВЛЕННЯ ТУТ) Використовуємо 'progressSubscriber' ---!!!
 // Обробник для оновлень ПРОГРЕСУ
-subscriber.subscribe(CHANNEL, (err) => {
+progressSubscriber.subscribe(CHANNEL, (err) => {
     if (err) console.error("Failed to subscribe to Redis channel:", err);
     else console.log(`✅ [PubSub] Subscribed to ${CHANNEL}`);
 });
 
 // Ми слухаємо ТІЛЬКИ 'CHANNEL'. 
 // 'CANCEL_CHANNEL' слухає лише 'worker.js'
-subscriber.on('message', (channel, message) => {
+// ---!!! (ВИПРАВЛЕННЯ ТУТ) Використовуємо 'progressSubscriber' ---!!!
+progressSubscriber.on('message', (channel, message) => {
     if (channel === CHANNEL) { 
         try {
             const update = JSON.parse(message);
@@ -208,9 +210,21 @@ app.delete('/api/tasks/:jobId', authenticateToken, async (req, res) => {
     const { jobId } = req.params;
     const userId = req.user.id;
 
+    console.log(`[SERVER] Отримано запит на скасування для jobId: ${jobId} (тип: ${typeof jobId})`); // <-- 1. ДОДАЙТЕ ЦЕЙ РЯДОК
+
     try {
         const task = await getTask(jobId);
-        if (!task || task.user_id !== userId) return res.status(404).send('Task not found.');
+        
+        // ---!!! (ВАЖЛИВО) Перевірка, чи знайшло завдання ---!!!
+        if (!task) {
+             // <-- 2. ДОДАЙТЕ ЦЕЙ РЯДОК
+             console.error(`❌ [SERVER] НЕ ЗНАЙШОВ завдання ${jobId} в БД! Перевірте, чи 'job_id' має тип TEXT і чи ви видалили hardwork.db.`);
+             return res.status(404).send('Task not found in DB. Check server logs.');
+        }
+
+        if (task.user_id !== userId) {
+            return res.status(404).send('Task not found.');
+        }
 
         if (task.status === 'RUNNING' || task.status === 'PENDING') {
             
@@ -224,10 +238,11 @@ app.delete('/api/tasks/:jobId', authenticateToken, async (req, res) => {
             }
 
             // 3. Публікуємо команду скасування для воркерів
+            // <-- 3. ДОДАЙТЕ ЦЕЙ РЯДОК
+            console.log(`[SERVER] ✅ Публікую команду скасування для ${jobId} в канал ${CANCEL_CHANNEL}`);
             await publisher.publish(CANCEL_CHANNEL, jobId);
             
             // 4. Негайно надсилаємо оновлення клієнту, щоб UI оновився
-            // (Тепер 'publishUpdate' визначено)
             await publishUpdate({
                 jobId: jobId,
                 userId: userId,
@@ -245,7 +260,6 @@ app.delete('/api/tasks/:jobId', authenticateToken, async (req, res) => {
         res.status(500).send('Error cancelling task.');
     }
 });
-
 
 // --- Запуск Сервера та Ініціалізація ---
 initDB().then(() => {

@@ -8,8 +8,6 @@ const DB_PATH = path.join(__dirname, '..', 'hardwork.db');
 /**
  * Ця функція тепер створює НОВЕ з'єднання з БД
  * і вмикає режим 'WAL' (Write-Ahead Logging).
- * WAL є КРИТИЧНО ВАЖЛИВИМ для того, щоб дозволити 'compute.js' (який читає)
- * бачити зміни, які 'server.js' (який пише) робить *одночасно*.
  */
 function getDbConnection() {
     return new Promise((resolve, reject) => {
@@ -19,12 +17,23 @@ function getDbConnection() {
             }
         });
 
-        // ВМИКАЄМО РЕЖИМ WAL (ВИРІШУЄ ПРОБЛЕМУ СКАСУВАННЯ)
+        // ВМИКАЄМО РЕЖИМ WAL (ДОЗВОЛЯЄ ОДНОЧАСНИЙ ЗАПИС/ЧИТАННЯ)
         db.exec('PRAGMA journal_mode = WAL;', (err) => {
             if (err) {
                 return reject(err);
             }
-            resolve(db);
+            
+            // ---!!! (ГОЛОВНЕ ВИПРАВЛЕННЯ ТУТ) !!!---
+            // Вказуємо SQLite почекати 5 секунд (5000 мс), якщо БД зайнята,
+            // перш ніж повертати помилку SQLITE_BUSY.
+            // Це вирішує конфлікти між воркером (UPDATE) та сервером (SELECT/UPDATE).
+            db.exec('PRAGMA busy_timeout = 5000;', (err) => {
+                if (err) {
+                    return reject(err);
+                }
+                resolve(db);
+            });
+            // ---!!! (КІНЕЦЬ ВИПРАВЛЕННЯ) !!!---
         });
     });
 }
@@ -32,21 +41,21 @@ function getDbConnection() {
 /**
  * Наш 'pool' тепер буде обгорткою, яка створює
  * нове з'єднання для кожного запиту і закриває його.
- * Це робить SQLite безпечним для паралельного доступу з багатьох процесів.
  */
 const pool = {
     query: (text, params = []) => {
         // Перетворюємо $1, $2 на ?, ? (синтаксис SQLite)
         const sql = text.replace(/\$\d+/g, '?');
-        
+        const command = sql.trim().toUpperCase(); 
+
         return new Promise(async (resolve, reject) => {
             let db;
             try {
                 // 1. Отримуємо нове, свіже з'єднання
                 db = await getDbConnection();
 
-                // 2. Виконуємо запит
-                if (sql.trim().toUpperCase().startsWith('SELECT')) {
+                // Перевіряємо, чи команда повертає рядки (SELECT або PRAGMA)
+                if (command.startsWith('SELECT') || command.startsWith('PRAGMA')) {
                     db.all(sql, params, (err, rows) => {
                         if (err) return reject(err);
                         resolve({ rows: rows });
@@ -74,8 +83,7 @@ const pool = {
     }
 };
 
-// Функція ініціалізації залишається такою ж, але тепер вона
-// буде використовувати наш новий 'pool.query', який безпечний для процесів.
+// Функція ініціалізації
 async function initDB() {
     try {
         console.log('Ініціалізація схеми SQLite...');
@@ -93,7 +101,10 @@ async function initDB() {
             CREATE TABLE IF NOT EXISTS tasks (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-                job_id INTEGER NOT NULL UNIQUE, 
+                
+                -- Переконуємось, що тут TEXT
+                job_id TEXT NOT NULL UNIQUE, 
+                
                 status TEXT NOT NULL DEFAULT 'PENDING',
                 progress INTEGER NOT NULL DEFAULT 0,
                 params TEXT, 
@@ -109,7 +120,12 @@ async function initDB() {
         
         // Перевіряємо, чи ввімкнено WAL
         const pragmaRes = await pool.query("PRAGMA journal_mode;");
-        console.log(`✅ Схему SQLite успішно ініціалізовано (Journal Mode: ${pragmaRes.rows[0].journal_mode})`);
+        
+        if (pragmaRes.rows && pragmaRes.rows.length > 0) {
+            console.log(`✅ Схему SQLite успішно ініціалізовано (Journal Mode: ${pragmaRes.rows[0].journal_mode})`);
+        } else {
+             console.log(`✅ Схему SQLite успішно ініціалізовано (Journal Mode: не вдалося визначити)`);
+        }
         
     } catch (err) {
         console.error("❌ Помилка ініціалізації SQLite:", err);
