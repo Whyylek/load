@@ -1,4 +1,4 @@
-/* style.css */
+
 body {
     font-family: Arial, sans-serif;
     background-color: #f0f2f5;
@@ -92,7 +92,7 @@ th {
     background-color: #f8f8f8;
 }
 
-/* Стилі для Progress Bar */
+
 .progress-bar-container {
     width: 100%;
     background-color: #e9ecef;
@@ -101,7 +101,7 @@ th {
 }
 
 .progress-bar {
-    width: 0%; /* Буде змінюватись через JS */
+    width: 0%; 
     height: 100%;
     background-color: #28a745;
     border-radius: 4px;
@@ -112,7 +112,7 @@ th {
     transition: width 0.3s ease;
 }
 
-/* Стилі для статусів */
+
 .status-pending { color: #6c757d; }
 .status-running { color: #007bff; }
 .status-completed { color: #28a745; }

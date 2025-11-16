@@ -1,30 +1,26 @@
-// src/queue.js
 const Bull = require('bull');
-const { pool } = require('./db'); // Імпортуємо наш новий "pool" з sqlite3 (з db.js)
+const { pool } = require('./db'); 
 require('dotenv').config();
 
 const REDIS_URL = process.env.REDIS_URL;
-const QUEUE_NAME = 'heavyTaskQueue'; // Назва вашої черги
+const QUEUE_NAME = 'heavyTaskQueue'; 
 
 const heavyTaskQueue = new Bull(QUEUE_NAME, REDIS_URL);
 console.log(`[Queue] Черга Bull "${QUEUE_NAME}" налаштована.`);
 
-/**
- * Додає завдання в чергу Bull та в базу даних SQLite.
- */
+
 async function addTask(taskParams, userId) {
     try {
-        // Додаємо завдання в чергу
+        
         const job = await heavyTaskQueue.add({
             taskParams,
             userId,
         });
 
-        // Зберігаємо JSON як рядок у SQLite
+     
         const paramsString = JSON.stringify(taskParams);
 
-        // Додаємо завдання в БД
-        // Наш новий pool.query з db.js автоматично перетворить $1, $2 на ?
+       
         await pool.query(
             'INSERT INTO tasks (user_id, job_id, params, status) VALUES ($1, $2, $3, $4)',
             [userId, job.id, paramsString, 'PENDING']
@@ -37,9 +33,7 @@ async function addTask(taskParams, userId) {
     }
 }
 
-/**
- * Отримує завдання з БД SQLite за його job_id.
- */
+
 async function getTask(jobId) {
     try {
         const res = await pool.query('SELECT * FROM tasks WHERE job_id = $1', [jobId]);

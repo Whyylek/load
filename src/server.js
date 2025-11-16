@@ -34,10 +34,10 @@ const MAX_CONCURRENT_TASKS = 5;
 const SALT_ROUNDS = 10;
 const userSocketMap = {}; 
 
-// --- Middleware та Утиліти ---
+
 app.use(express.json());
 
-// Middleware для авторизації (JWT)
+
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -51,7 +51,6 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-// --- Socket.IO та Обробка Pub/Sub ---
 io.use((socket, next) => {
     const token = socket.handshake.auth.token || socket.handshake.query.token;
     if (!token) return next(new Error("Authentication error: No token provided"));
@@ -73,16 +72,13 @@ io.on('connection', (socket) => {
     });
 });
 
-// ---!!! (ВИПРАВЛЕННЯ ТУТ) Використовуємо 'progressSubscriber' ---!!!
-// Обробник для оновлень ПРОГРЕСУ
+
 progressSubscriber.subscribe(CHANNEL, (err) => {
     if (err) console.error("Failed to subscribe to Redis channel:", err);
     else console.log(`✅ [PubSub] Subscribed to ${CHANNEL}`);
 });
 
-// Ми слухаємо ТІЛЬКИ 'CHANNEL'. 
-// 'CANCEL_CHANNEL' слухає лише 'worker.js'
-// ---!!! (ВИПРАВЛЕННЯ ТУТ) Використовуємо 'progressSubscriber' ---!!!
+
 progressSubscriber.on('message', (channel, message) => {
     if (channel === CHANNEL) { 
         try {
@@ -104,9 +100,9 @@ progressSubscriber.on('message', (channel, message) => {
 });
 
 
-// --- API Роути ---
 
-// Реєстрація користувача
+
+
 app.post('/register', async (req, res) => {
     const { username, password } = req.body;
     try {
@@ -135,7 +131,7 @@ app.post('/register', async (req, res) => {
     }
 });
 
-// Логін користувача
+
 app.post('/login', async (req, res) => {
     const { username, password } = req.body;
     
@@ -152,7 +148,7 @@ app.post('/login', async (req, res) => {
     res.json({ accessToken, userId: user.id });
 });
 
-// 1. Запуск нової трудомісткої задачі
+
 app.post('/api/tasks', authenticateToken, async (req, res) => {
     const { taskParams } = req.body; 
     const userId = req.user.id;
@@ -184,7 +180,7 @@ app.post('/api/tasks', authenticateToken, async (req, res) => {
     }
 });
 
-// 2. Перегляд історії задач
+
 app.get('/api/tasks', authenticateToken, async (req, res) => {
     const userId = req.user.id;
     try {
@@ -205,7 +201,6 @@ app.get('/api/tasks', authenticateToken, async (req, res) => {
     }
 });
 
-// 3. Скасування задачі
 app.delete('/api/tasks/:jobId', authenticateToken, async (req, res) => {
     const { jobId } = req.params;
     const userId = req.user.id;
@@ -215,9 +210,9 @@ app.delete('/api/tasks/:jobId', authenticateToken, async (req, res) => {
     try {
         const task = await getTask(jobId);
         
-        // ---!!! (ВАЖЛИВО) Перевірка, чи знайшло завдання ---!!!
+        
         if (!task) {
-             // <-- 2. ДОДАЙТЕ ЦЕЙ РЯДОК
+             
              console.error(`❌ [SERVER] НЕ ЗНАЙШОВ завдання ${jobId} в БД! Перевірте, чи 'job_id' має тип TEXT і чи ви видалили hardwork.db.`);
              return res.status(404).send('Task not found in DB. Check server logs.');
         }
@@ -228,21 +223,20 @@ app.delete('/api/tasks/:jobId', authenticateToken, async (req, res) => {
 
         if (task.status === 'RUNNING' || task.status === 'PENDING') {
             
-            // 1. Оновлюємо статус в БД
+            
             await updateTaskStatus(jobId, 'CANCELED', task.progress, { status: 'Canceled by user' }); 
             
-            // 2. Видаляємо з черги, якщо воно ще не почалося
+            
             const job = await heavyTaskQueue.getJob(jobId);
             if (job && task.status === 'PENDING') {
                 await job.remove();
             }
 
-            // 3. Публікуємо команду скасування для воркерів
-            // <-- 3. ДОДАЙТЕ ЦЕЙ РЯДОК
+           
             console.log(`[SERVER] ✅ Публікую команду скасування для ${jobId} в канал ${CANCEL_CHANNEL}`);
             await publisher.publish(CANCEL_CHANNEL, jobId);
             
-            // 4. Негайно надсилаємо оновлення клієнту, щоб UI оновився
+            
             await publishUpdate({
                 jobId: jobId,
                 userId: userId,
@@ -261,7 +255,7 @@ app.delete('/api/tasks/:jobId', authenticateToken, async (req, res) => {
     }
 });
 
-// --- Запуск Сервера та Ініціалізація ---
+
 initDB().then(() => {
     httpServer.listen(PORT, () => {
         console.log(`✅ API Gateway Node.js server (SQLite) running on port ${PORT}`);

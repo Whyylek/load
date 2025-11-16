@@ -1,9 +1,9 @@
-// src/worker.js
+
 const { Worker } = require('worker_threads');
 const path = require('path'); 
 require('dotenv').config();
 
-// Імпортуємо наші модулі
+
 const { heavyTaskQueue, updateTaskStatus } = require('./queue'); 
 const { publishUpdate, CHANNEL, cancelSubscriber, CANCEL_CHANNEL } = require('./pubsub'); 
 
@@ -23,27 +23,26 @@ cancelSubscriber.subscribe(CANCEL_CHANNEL, (err) => {
     }
 });
 
-// Обробник повідомлень (включає тепер і скасування)
+
 cancelSubscriber.on('message', (channel, message) => {
     console.log(`[WORKER] Отримав повідомлення в каналі ${channel}: ${message} (тип: ${typeof message})`);
 
     if (channel === CANCEL_CHANNEL) {
-        // ---!!! (ВИПРАВЛЕННЯ 1) Перетворюємо message на рядок ---!!!
-        // Це гарантує, що ми шукаємо "123", а не 123.
+    
         const jobIdToCancel = message.toString(); 
         
         console.log(`[WORKER] Мої активні воркери (перед .get()):`, Array.from(activeWorkers.keys()));
 
-        // ---!!! (ВИПРАВЛЕННЯ 2) Шукаємо за ключем-РЯДКОМ ---!!!
+     
         const workerToCancel = activeWorkers.get(jobIdToCancel);
         
         if (workerToCancel) {
             console.log(`[WORKER] ✅ Знайшов воркер ${jobIdToCancel}! Завершую потік...`);
             
-            // Примусово "вбиваємо" потік
+           
             workerToCancel.terminate();
             
-            // ---!!! (ВИПРАВЛЕННЯ 3) Видаляємо за ключем-РЯДКОМ ---!!!
+  
             activeWorkers.delete(jobIdToCancel);
             
         } else {
@@ -53,12 +52,10 @@ cancelSubscriber.on('message', (channel, message) => {
 });
 
 
-/**
- * Головний обробник черги Bull
- */
+
 heavyTaskQueue.process(CONCURRENCY, async (job) => {
     const { taskParams, userId } = job.data;
-    const jobId = job.id; // job.id з Bull (може бути числом або рядком, тому .toString() важливий)
+    const jobId = job.id; 
 
     console.log(`[Worker: ${WORKER_ID}] ⏯️  Отримано завдання ${jobId} для користувача ${userId}`);
 
@@ -77,7 +74,7 @@ heavyTaskQueue.process(CONCURRENCY, async (job) => {
                 workerData: { taskParams, userId, jobId }, 
             });
 
-            // Ключ ЗАВЖДИ зберігається як РЯДОК
+           
             const jobIdString = jobId.toString();
             activeWorkers.set(jobIdString, worker);
             console.log(`[WORKER] Додав воркер для ${jobIdString} в 'activeWorkers'. Мапа тепер:`, Array.from(activeWorkers.keys()));
@@ -111,7 +108,7 @@ heavyTaskQueue.process(CONCURRENCY, async (job) => {
                 
                 } else if (message.type === 'failed') {
                     console.error(`[Worker: ${WORKER_ID}] ❌ Помилка в потоці ${jobId}: ${message.error}`);
-                    activeWorkers.delete(jobIdString); // Видаляємо з мапи за РЯДКОМ
+                    activeWorkers.delete(jobIdString); 
                     
                     await updateTaskStatus(jobId, 'FAILED', 100, { error: message.error });
                     await publishUpdate({
@@ -128,7 +125,7 @@ heavyTaskQueue.process(CONCURRENCY, async (job) => {
 
             worker.on('error', async (err) => {
                 console.error(`[Worker: ${WORKER_ID}] ❌ Критична помилка потоку ${jobId}:`, err);
-                activeWorkers.delete(jobIdString); // Видаляємо з мапи за РЯДКОМ
+                activeWorkers.delete(jobIdString); 
                 
                 await updateTaskStatus(jobId, 'FAILED', 100, { error: err.message });
                 await publishUpdate({
@@ -143,13 +140,12 @@ heavyTaskQueue.process(CONCURRENCY, async (job) => {
             });
 
             worker.on('exit', (code) => {
-                // Цей код (1) спрацює при .terminate()
+               
                 if (code !== 0) {
                     console.log(`[Worker: ${WORKER_ID}] ℹ️  Потік ${jobId} був зупинений (код: ${code}).`);
-                    activeWorkers.delete(jobIdString); // Видаляємо з мапи за РЯДКОМ
+                    activeWorkers.delete(jobIdString);
                     
-                    // 'server.js' вже оновив статус на 'CANCELED'.
-                    // Тут ми просто завершуємо 'job' в Bull, щоб він не завис.
+                    
                     resolve({ status: 'terminated' }); 
                 }
             });

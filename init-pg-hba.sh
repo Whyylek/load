@@ -1,4 +1,4 @@
-﻿#!/bin/bash
+﻿
 set -e
 
 echo "Applying custom pg_hba.conf..."
