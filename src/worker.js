@@ -1,22 +1,59 @@
 // src/worker.js
 const { Worker } = require('worker_threads');
-const path = require('path'); // <--- ОСЬ ВИПРАВЛЕННЯ: Імпортуємо модуль 'path'
+const path = require('path'); 
 require('dotenv').config();
 
-// Створюємо змінну для шляху до нашого скрипта обчислень
+// Імпортуємо наші модулі
+const { heavyTaskQueue, updateTaskStatus } = require('./queue'); 
+// ---!!! (ВИПРАВЛЕННЯ 1) Імпортуємо 'subscriber' та 'CANCEL_CHANNEL' ---!!!
+const { publishUpdate, CHANNEL, subscriber, CANCEL_CHANNEL } = require('./pubsub'); 
+
 const computeScriptPath = path.join(__dirname, 'compute.js'); 
-
-// Імпортуємо наші нові модулі, сумісні з SQLite
-const { heavyTaskQueue, updateTaskStatus } = require('./queue'); //
-const { publishUpdate, CHANNEL } = require('./pubsub'); //
-
-// Унікальний ID для цього воркера
 const WORKER_ID = process.env.WORKER_ID || `Worker-${process.pid}`;
-
-// Кількість одночасних завдань
 const CONCURRENCY = 1;
 
+// ---!!! (ВИПРАВЛЕННЯ 2) Мапа для зберігання активних потоків ---!!!
+// Вона буде зберігати: { 'jobId-123': <WorkerThread>, 'jobId-456': <WorkerThread> }
+const activeWorkers = new Map();
+
 console.log(`[Worker: ${WORKER_ID}] ✅ Сервер обчислень (SQLite) запущено. Очікую на завдання...`);
+
+// ---!!! (ВИПРАВЛЕННЯ 3) Підписка на канал скасування ---!!!
+subscriber.subscribe(CANCEL_CHANNEL, (err) => {
+    if (err) {
+        console.error(`❌ [Worker: ${WORKER_ID}] Помилка підписки на ${CANCEL_CHANNEL}`, err);
+    } else {
+        console.log(`✅ [Worker: ${WORKER_ID}] Підписано на канал скасування: ${CANCEL_CHANNEL}`);
+    }
+});
+
+// Обробник повідомлень (включає тепер і скасування)
+subscriber.on('message', (channel, message) => {
+    // Цей воркер тепер слухає два типи повідомлень, 
+    // але 'message' з 'CHANNEL' (прогрес) нас не цікавить, 
+    // оскільки воркер не має Socket.IO. Нас цікавить лише CANCEL_CHANNEL.
+
+    if (channel === CANCEL_CHANNEL) {
+        const jobIdToCancel = message; // 'message' тут - це просто jobId
+        
+        // Перевіряємо, чи *цей* воркер зараз виконує це завдання
+        const workerToCancel = activeWorkers.get(jobIdToCancel);
+        
+        if (workerToCancel) {
+            console.log(`[Worker: ${WORKER_ID}] 🛑 Отримано команду скасування для завдання ${jobIdToCancel}. Завершую потік...`);
+            
+            // Примусово "вбиваємо" потік
+            workerToCancel.terminate();
+            
+            // Видаляємо його з мапи активних
+            activeWorkers.delete(jobIdToCancel);
+            
+            // Ми не оновлюємо статус/не публікуємо, 
+            // оскільки 'server.js' вже зробив це за нас.
+        }
+    }
+});
+
 
 /**
  * Головний обробник черги Bull
@@ -28,7 +65,6 @@ heavyTaskQueue.process(CONCURRENCY, async (job) => {
     console.log(`[Worker: ${WORKER_ID}] ⏯️  Отримано завдання ${jobId} для користувача ${userId}`);
 
     try {
-        // 1. Позначити завдання як 'RUNNING' в БД та повідомити клієнта
         await updateTaskStatus(jobId, 'RUNNING', 0, null);
         await publishUpdate({ 
             jobId: jobId, 
@@ -38,24 +74,16 @@ heavyTaskQueue.process(CONCURRENCY, async (job) => {
             workerId: WORKER_ID 
         });
 
-        // 2. Створити Promise, який буде очікувати завершення потоку
         return new Promise((resolve, reject) => {
-            
-            // Запускаємо наш CPU-інтенсивний файл в окремому потоці
-            // Використовуємо змінну `computeScriptPath`
             const worker = new Worker(computeScriptPath, {
-                workerData: { 
-                    taskParams, 
-                    userId, 
-                    jobId 
-                }, // Передаємо дані в потік
+                workerData: { taskParams, userId, jobId }, 
             });
 
-            // 3. Обробка повідомлень від потоку
+            // ---!!! (ВИПРАВЛЕННЯ 4) Додаємо потік до мапи активних ---!!!
+            activeWorkers.set(jobId.toString(), worker);
+
             worker.on('message', async (message) => {
-                
                 if (message.type === 'progress') {
-                    // (Пункт 2: Інформування про хід виконання)
                     await updateTaskStatus(jobId, 'RUNNING', message.progress, null);
                     await publishUpdate({
                         jobId: jobId,
@@ -67,6 +95,7 @@ heavyTaskQueue.process(CONCURRENCY, async (job) => {
                 
                 } else if (message.type === 'completed') {
                     console.log(`[Worker: ${WORKER_ID}] 🏁 Завдання ${jobId} завершено.`);
+                    activeWorkers.delete(jobId.toString()); // Видаляємо з мапи
                     
                     await updateTaskStatus(jobId, 'COMPLETED', 100, message.result);
                     await publishUpdate({
@@ -74,35 +103,33 @@ heavyTaskQueue.process(CONCURRENCY, async (job) => {
                         userId: userId,
                         status: 'COMPLETED',
                         progress: 100,
-                        result: message.result, // Надсилаємо фінальний результат
+                        result: message.result, 
                         workerId: WORKER_ID,
                     });
-                    resolve(message.result); // Завершуємо завдання Bull
+                    resolve(message.result);
                 
                 } else if (message.type === 'failed') {
                     console.error(`[Worker: ${WORKER_ID}] ❌ Помилка в потоці ${jobId}: ${message.error}`);
+                    activeWorkers.delete(jobId.toString()); // Видаляємо з мапи
+                    
                     await updateTaskStatus(jobId, 'FAILED', 100, { error: message.error });
                     await publishUpdate({
                         jobId: jobId,
                         userId: userId,
                         status: 'FAILED',
                         progress: 100,
-                        result: { error: message.error }, // Надсилаємо помилку
+                        result: { error: message.error }, 
                         workerId: WORKER_ID,
                     });
-                    reject(new Error(message.error)); // Повідомляємо Bull про помилку
-                
-                } else if (message.type === 'canceled') {
-                    // (Пункт 3: Скасування задачі)
-                    console.log(`[Worker: ${WORKER_ID}] 🛑 Завдання ${jobId} скасовано потоком.`);
-                    // Статус 'CANCELED' вже встановлено в БД з server.js
-                    resolve({ status: 'canceled' });
+                    reject(new Error(message.error)); 
                 }
+                // Нам більше не потрібен 'canceled', оскільки ми "вбиваємо" потік
             });
 
-            // 4. Обробка критичних помилок потоку
             worker.on('error', async (err) => {
                 console.error(`[Worker: ${WORKER_ID}] ❌ Критична помилка потоку ${jobId}:`, err);
+                activeWorkers.delete(jobId.toString());
+                
                 await updateTaskStatus(jobId, 'FAILED', 100, { error: err.message });
                 await publishUpdate({
                     jobId,
@@ -116,23 +143,25 @@ heavyTaskQueue.process(CONCURRENCY, async (job) => {
             });
 
             worker.on('exit', (code) => {
+                // Цей код (1) спрацює при .terminate()
                 if (code !== 0) {
-                    const errorMsg = `Потік несподівано завершився з кодом ${code}`;
-                    console.error(`[Worker: ${WORKER_ID}] ❌ ${errorMsg} для ${jobId}`);
-                    // Завдання буде позначено як FAILED
-                    reject(new Error(errorMsg));
+                    console.log(`[Worker: ${WORKER_ID}] ℹ️  Потік ${jobId} був зупинений (код: ${code}).`);
+                    activeWorkers.delete(jobId.toString());
+                    
+                    // Ми вже оновили статус на 'CANCELED' в server.js, 
+                    // тому тут достатньо просто завершити job.
+                    // 'resolve()' означає "успішно скасовано".
+                    resolve({ status: 'terminated' }); 
                 }
             });
         });
     } catch (e) {
         console.error(`[Worker: ${WORKER_ID}] ❌ Фатальна помилка обробки ${jobId}:`, e);
-        // Якщо помилка сталася до запуску потоку
         await updateTaskStatus(jobId, 'FAILED', 0, { error: e.message });
-        throw e; // Bull перенесе завдання у failed
+        throw e;
     }
 });
 
-// Обробка помилок самої черги
 heavyTaskQueue.on('failed', (job, err) => {
   console.error(`[Worker: ${WORKER_ID}] ❌ Завдання ${job.id} зазнало невдачі в Bull:`, err.message);
 });

@@ -7,11 +7,12 @@ const { Server } = require('socket.io');
 const cors = require('cors'); 
 require('dotenv').config();
 
-// Логіка з наших НОВИХ файлів SQLite:
+// Логіка з наших файлів SQLite:
 const { initDB, pool } = require('./db'); 
 const { addTask, getTask, updateTaskStatus, heavyTaskQueue } = require('./queue'); 
-// ---!!! (ВИПРАВЛЕННЯ 1) Імпортуємо 'publishUpdate' ---!!!
-const { subscriber, CHANNEL, publishUpdate } = require('./pubsub'); 
+
+// ---!!! (ВИПРАВЛЕННЯ ТУТ) Додаємо 'publishUpdate' до імпорту ---!!!
+const { subscriber, CHANNEL, publisher, CANCEL_CHANNEL, publishUpdate } = require('./pubsub'); 
 
 const app = express();
 const httpServer = http.createServer(app); 
@@ -72,13 +73,16 @@ io.on('connection', (socket) => {
     });
 });
 
+// Обробник для оновлень ПРОГРЕСУ
 subscriber.subscribe(CHANNEL, (err) => {
     if (err) console.error("Failed to subscribe to Redis channel:", err);
     else console.log(`✅ [PubSub] Subscribed to ${CHANNEL}`);
 });
 
+// Ми слухаємо ТІЛЬКИ 'CHANNEL'. 
+// 'CANCEL_CHANNEL' слухає лише 'worker.js'
 subscriber.on('message', (channel, message) => {
-    if (channel === CHANNEL) {
+    if (channel === CHANNEL) { 
         try {
             const update = JSON.parse(message);
             const targetSocketId = userSocketMap[update.userId]; 
@@ -210,24 +214,27 @@ app.delete('/api/tasks/:jobId', authenticateToken, async (req, res) => {
 
         if (task.status === 'RUNNING' || task.status === 'PENDING') {
             
-            // Оновлюємо статус в БД (встановлюємо 100% прогрес)
-            await updateTaskStatus(jobId, 'CANCELED', 100, { status: 'Canceled by user' }); 
+            // 1. Оновлюємо статус в БД
+            await updateTaskStatus(jobId, 'CANCELED', task.progress, { status: 'Canceled by user' }); 
             
-            // Видаляємо з черги, якщо воно ще не почалося
+            // 2. Видаляємо з черги, якщо воно ще не почалося
             const job = await heavyTaskQueue.getJob(jobId);
             if (job && task.status === 'PENDING') {
                 await job.remove();
             }
 
-            // ---!!! (ВИПРАВЛЕННЯ 2) Негайно надсилаємо оновлення клієнту ---!!!
+            // 3. Публікуємо команду скасування для воркерів
+            await publisher.publish(CANCEL_CHANNEL, jobId);
+            
+            // 4. Негайно надсилаємо оновлення клієнту, щоб UI оновився
+            // (Тепер 'publishUpdate' визначено)
             await publishUpdate({
                 jobId: jobId,
                 userId: userId,
                 status: 'CANCELED',
-                progress: 100, 
+                progress: task.progress, 
                 result: { status: 'Canceled by user' }
             });
-            // ---!!! ----------------------------------------------------- !!!---
 
             return res.send(`Task ${jobId} successfully marked for cancellation.`);
         }
