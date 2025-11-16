@@ -1,0 +1,253 @@
+<!DOCTYPE html>
+<html lang="uk">
+<head>
+    <meta charset="UTF-8">
+    <title>Load Balancer App - Керування Задачами</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 900px; margin: 0 auto; padding: 20px; }
+        h2 { border-bottom: 2px solid #ccc; padding-bottom: 5px; }
+        .container { margin-bottom: 20px; padding: 15px; border: 1px solid #eee; border-radius: 5px; }
+        button, input { padding: 10px; margin: 5px 0; border-radius: 4px; border: 1px solid #ccc; }
+        .task-item { border-bottom: 1px dashed #ddd; padding: 10px 0; }
+        .progress-bar { height: 10px; background-color: #f3f3f3; border-radius: 5px; margin-top: 5px; }
+        .progress-fill { height: 100%; background-color: #4CAF50; border-radius: 5px; transition: width 0.3s; }
+        .error { color: red; }
+        .success { color: green; }
+    </style>
+    <script src="http://localhost/socket.io/socket.io.js"></script> 
+</head>
+<body>
+
+    <h1>🚀 Тестування Балансування Навантаження</h1>
+
+    <div class="container" id="auth-section">
+        <h2>🔑 Авторизація</h2>
+        <input type="text" id="username" placeholder="Ім'я користувача (напр. user1)">
+        <input type="password" id="password" placeholder="Пароль">
+        <button onclick="registerUser()">Реєстрація</button>
+        <button onclick="loginUser()">Увійти</button>
+        <p id="auth-message"></p>
+    </div>
+
+    <div id="app-section" style="display:none;">
+
+        <p>Підключено як: <strong id="current-user"></strong> | <span id="socket-status" class="error">Socket.IO: Відключено</span></p>
+
+        <div class="container">
+            <h2>⚙️ Запустити Нову Задачу</h2>
+            <input type="number" id="iterations" placeholder="Кількість Ітерацій (Наприклад, 10000000000)" value="10000000000" min="1000">
+            <button onclick="submitTask()">Запустити Трудомістку Задачу</button>
+            <p id="task-message"></p>
+        </div>
+
+        <div class="container">
+            <h2>📜 Історія та Поточний Стан Задач (Пункт 3)</h2>
+            <button onclick="fetchTasks()">Оновити Історію</button>
+            <div id="task-list"></div>
+        </div>
+    </div>
+
+    <script>
+        const NGINX_URL = 'http://localhost'; // Усі запити йдуть на Nginx (порт 80)
+        let userToken = localStorage.getItem('accessToken') || '';
+        let currentUserId = localStorage.getItem('userId') || null;
+        let currentUsername = localStorage.getItem('username') || '';
+        let socket = null;
+
+        // --- Управління станом UI ---
+
+        function updateUI() {
+            if (userToken) {
+                document.getElementById('auth-section').style.display = 'none';
+                document.getElementById('app-section').style.display = 'block';
+                document.getElementById('current-user').textContent = currentUsername || 'N/A';
+                connectSocket(userToken);
+                fetchTasks();
+            } else {
+                document.getElementById('auth-section').style.display = 'block';
+                document.getElementById('app-section').style.display = 'none';
+                if (socket) socket.disconnect();
+            }
+        }
+
+        // --- 1. Авторизація (Реєстрація/Логін) ---
+
+        async function authRequest(endpoint, username, password) {
+            const response = await fetch(`${NGINX_URL}/${endpoint}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, password })
+            });
+            const data = await response.json();
+            const msgEl = document.getElementById('auth-message');
+            msgEl.className = response.ok ? 'success' : 'error';
+
+            if (response.ok) {
+                userToken = data.accessToken;
+                currentUserId = data.userId;
+                currentUsername = username;
+                localStorage.setItem('accessToken', userToken);
+                localStorage.setItem('userId', currentUserId);
+                localStorage.setItem('username', currentUsername);
+                msgEl.textContent = `Успіх! Вітаємо, ${username}.`;
+                updateUI();
+            } else {
+                msgEl.textContent = data.message || `Помилка: ${response.statusText}`;
+            }
+        }
+
+        function registerUser() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            authRequest('register', username, password);
+        }
+
+        function loginUser() {
+            const username = document.getElementById('username').value;
+            const password = document.getElementById('password').value;
+            authRequest('login', username, password);
+        }
+
+        // --- 2. Socket.IO (Прогрес в реальному часі) ---
+
+        function connectSocket(token) {
+            if (socket && socket.connected) return;
+
+            socket = io(NGINX_URL, {
+                auth: { token: token },
+                reconnectionAttempts: 5,
+            });
+
+            const statusEl = document.getElementById('socket-status');
+
+            socket.on('connect', () => {
+                statusEl.textContent = 'Socket.IO: Підключено';
+                statusEl.className = 'success';
+            });
+
+            socket.on('connect_error', (error) => {
+                statusEl.textContent = `Socket.IO: Помилка підключення (${error.message})`;
+                statusEl.className = 'error';
+                console.error('Socket.IO Error:', error);
+            });
+            
+            // Оновлення прогресу від Worker'ів через Pub/Sub (Пункт 2)
+            socket.on('task_update', (data) => {
+                updateTaskDisplay(data);
+            });
+        }
+        
+        // --- 3. Керування Задачами (Запуск, Історія, Скасування) ---
+        
+        async function submitTask() {
+            const iterations = parseInt(document.getElementById('iterations').value);
+            const msgEl = document.getElementById('task-message');
+            msgEl.textContent = '';
+
+            if (isNaN(iterations) || iterations < 1000) {
+                msgEl.className = 'error';
+                msgEl.textContent = 'Кількість ітерацій має бути > 1000.';
+                return;
+            }
+
+            const response = await fetch(NGINX_URL + '/api/tasks', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    'Authorization': `Bearer ${userToken}`
+                },
+                body: JSON.stringify({ taskParams: { iterations } })
+            });
+
+            const result = await response.json();
+            msgEl.className = response.ok ? 'success' : 'error';
+            msgEl.textContent = result.message || JSON.stringify(result);
+            
+            if (result.taskId) {
+                // Додаємо нову задачу до списку і починаємо її відстежувати
+                fetchTasks(); 
+            }
+        }
+
+        async function fetchTasks() {
+            const response = await fetch(NGINX_URL + '/api/tasks', {
+                method: 'GET',
+                headers: { 'Authorization': `Bearer ${userToken}` }
+            });
+
+            if (!response.ok) {
+                document.getElementById('task-list').innerHTML = `<p class="error">Помилка завантаження історії: ${response.statusText}</p>`;
+                return;
+            }
+
+            const tasks = await response.json();
+            const listEl = document.getElementById('task-list');
+            listEl.innerHTML = '';
+            
+            tasks.forEach(task => {
+                const taskEl = document.createElement('div');
+                taskEl.className = 'task-item';
+                taskEl.id = `task-${task.job_id}`;
+                taskEl.innerHTML = renderTaskItem(task);
+                listEl.appendChild(taskEl);
+            });
+        }
+        
+        async function cancelTask(jobId) {
+            const response = await fetch(`${NGINX_URL}/api/tasks/${jobId}`, {
+                method: 'DELETE',
+                headers: { 'Authorization': `Bearer ${userToken}` }
+            });
+            
+            if (response.ok) {
+                alert(`Задача ${jobId} відмінена. Оновлення статусу очікується.`);
+                // Статус буде оновлено через WebSocket
+            } else {
+                alert(`Помилка скасування: ${response.statusText}`);
+            }
+        }
+
+        function updateTaskDisplay(data) {
+            const taskEl = document.getElementById(`task-${data.taskId}`);
+            if (taskEl) {
+                // Оновлюємо лише статус і прогрес
+                taskEl.querySelector('.task-status-text').textContent = data.status;
+                taskEl.querySelector('.progress-fill').style.width = `${data.progress}%`;
+                taskEl.querySelector('.progress-percent').textContent = `${data.progress}%`;
+            } else {
+                // Якщо задача ще не в історії, але прийшло перше оновлення, перезавантажуємо історію
+                fetchTasks();
+            }
+        }
+        
+        // --- Рендеринг елемента задачі ---
+        
+        function renderTaskItem(task) {
+            const statusColor = task.status === 'COMPLETED' ? 'green' : (task.status === 'RUNNING' ? 'blue' : (task.status === 'ERROR' ? 'red' : 'gray'));
+            const cancelBtn = (task.status === 'RUNNING' || task.status === 'PENDING') 
+                              ? `<button onclick="cancelTask('${task.job_id}')">Скасувати</button>` 
+                              : '';
+                              
+            return `
+                <div>
+                    <strong>ID: ${task.job_id}</strong> (PG ID: ${task.id}) - Створено: ${new Date(task.created_at).toLocaleTimeString()}
+                    <br>
+                    Параметри: ${JSON.stringify(task.params)}
+                    <br>
+                    Статус: <span class="task-status-text" style="color: ${statusColor};">${task.status}</span>
+                    <span class="progress-percent">${task.progress}%</span>
+                    ${cancelBtn}
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" style="width: ${task.progress}%;"></div>
+                </div>
+                ${task.result ? `<p class="success">Результат: ${JSON.stringify(task.result)}</p>` : ''}
+            `;
+        }
+
+        // Ініціалізація
+        document.addEventListener('DOMContentLoaded', updateUI);
+    </script>
+
+</body>
+</html>
